@@ -1,0 +1,808 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<title>BONSAI</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  html, body {
+    width: 100%; height: 100%;
+    background: #000;
+    overflow: hidden;
+  }
+  #screen {
+    display: block;
+    white-space: pre;
+    color: #fff;
+    font-family: 'Courier New', monospace;
+    line-height: 1.0;
+    position: absolute;
+    top: 0; left: 0;
+    user-select: none;
+    cursor: crosshair;
+  }
+  #selection {
+    position: absolute;
+    display: none;
+    background: rgba(158, 255, 176, 0.18);
+    border: 1px dashed rgba(158, 255, 176, 0.7);
+    pointer-events: none;
+  }
+  #status {
+    position: fixed;
+    bottom: 12px;
+    left: 14px;
+    color: #7a8a7a;
+    font-family: 'Courier New', monospace;
+    font-size: 13px;
+    letter-spacing: 0.5px;
+    text-shadow: 0 0 6px rgba(0,0,0,0.8);
+    pointer-events: none;
+  }
+  #hud {
+    position: fixed;
+    bottom: 12px;
+    right: 14px;
+    color: #9effb0;
+    font-family: 'Courier New', monospace;
+    font-size: 14px;
+    letter-spacing: 0.5px;
+    text-shadow: 0 0 6px rgba(0,0,0,0.8);
+    opacity: 0;
+    pointer-events: none;
+    transition: opacity 0.4s ease;
+  }
+</style>
+</head>
+<body>
+<div id="screen"></div>
+<div id="selection"></div>
+<div id="status"></div>
+<div id="hud"></div>
+<script>
+
+// ── Persistence ──────────────────────────────────────────────────────────
+const SEED_KEY = 'bonsai_seed_v1';
+const TIME_KEY = 'bonsai_seconds_v1';
+
+function loadOrCreateSeed() {
+  let s = localStorage.getItem(SEED_KEY);
+  if (!s) {
+    s = String(Math.floor(Math.random() * 1e9));
+    localStorage.setItem(SEED_KEY, s);
+  }
+  return parseInt(s, 10);
+}
+
+function loadElapsed() {
+  const v = parseFloat(localStorage.getItem(TIME_KEY));
+  return isNaN(v) ? 0 : v;
+}
+
+let SEED = loadOrCreateSeed();
+const baseElapsed = loadElapsed();
+const loadTimestamp = Date.now();
+
+function currentElapsedSeconds() {
+  return baseElapsed + (Date.now() - loadTimestamp) / 1000;
+}
+
+function saveElapsed() {
+  localStorage.setItem(TIME_KEY, currentElapsedSeconds().toFixed(1));
+}
+
+// ── Growth curve ─────────────────────────────────────────────────────────
+const TOTAL_GROWTH_SECONDS = 4 * 3600; // fully mature after ~4 hours of open time
+
+function growthFraction() {
+  const t = Math.min(1, currentElapsedSeconds() / TOTAL_GROWTH_SECONDS);
+  return 1 - Math.pow(1 - t, 3); // ease-out: quick sprout, slow detailed maturation
+}
+
+function stageName(g) {
+  if (g < 0.02) return 'Seed';
+  if (g < 0.12) return 'Sprout';
+  if (g < 0.30) return 'Seedling';
+  if (g < 0.55) return 'Sapling';
+  if (g < 0.80) return 'Young Tree';
+  if (g < 0.98) return 'Bonsai';
+  return 'Mature Bonsai';
+}
+
+function formatElapsed(s) {
+  const totalMin = Math.floor(s / 60);
+  const h = Math.floor(totalMin / 60);
+  const m = totalMin % 60;
+  if (h > 0) return h + 'h ' + m + 'm';
+  if (m > 0) return m + 'm';
+  return Math.floor(s) + 's';
+}
+
+// ── Color mode ───────────────────────────────────────────────────────────
+let COLOR = false;
+
+const L = { BG:0, SEED:1, TRUNK:2, LEAF:3, POT:4, SOIL:5, BLOSSOM:6, TIP:7 };
+const PALETTE = {
+  [L.BG]:      null,
+  [L.SEED]:    '#c9a66b',
+  [L.TRUNK]:   '#8b5e34',
+  [L.LEAF]:    null, // per-cluster color chosen at generation time
+  [L.POT]:     '#a0522d',
+  [L.SOIL]:    '#5a3d2b',
+  [L.BLOSSOM]: '#e08bb8',
+  [L.TIP]:     '#bfe8a0',
+};
+const LEAF_COLORS = ['#4a7c59', '#6b9c46', '#3d6b35'];
+const LEAF_CHARS = ['&', '%', '@', '*'];
+const SOIL_CHARS = ['.', ',', '`', "'"];
+
+// ── PRNG (seeded, deterministic) ────────────────────────────────────────
+function mulberry32(seed) {
+  return function () {
+    seed |= 0; seed = (seed + 0x6D2B79F5) | 0;
+    let t = Math.imul(seed ^ (seed >>> 15), 1 | seed);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+
+function charForAngle(angle) {
+  const a = Math.abs(angle);
+  if (a < 0.35) return '|';
+  if (a < 1.1) return angle > 0 ? '/' : '\\';
+  return '-';
+}
+
+const MARGIN = 2; // cells kept clear of the grid edge when growing a curve
+const EDGE_STEER_BUFFER = 5; // start nudging the heading back inward this many cells from an edge
+const EDGE_STEER_STRENGTH = 0.18; // radians of nudge applied per step while inside the buffer
+
+// Grows a curve from startAngle to endAngle over `length` steps (plus a
+// little wobble), stopping early if it would leave the visible canvas.
+// Shared by the main tree generator and by regrowth after a prune. As the
+// curve nears an edge it steers its heading back toward the interior —
+// like a real branch bending toward open space — so it curves away rather
+// than abruptly stopping there; the margin check remains as a last resort.
+function growCurve(rng, cols, rows, x, y, startAngle, endAngle, length) {
+  const pts = [];
+  let cx = x, cy = y;
+  const steps = Math.max(2, Math.round(length));
+  const wobbleFreq = 0.4 + rng() * 0.3;
+  const wobbleAmp = 0.05 + rng() * 0.06;
+  const wobblePhase = rng() * 10;
+  let truncated = false;
+  for (let i = 0; i < steps; i++) {
+    const t = steps > 1 ? i / (steps - 1) : 0;
+    const baseAngle = startAngle + (endAngle - startAngle) * t;
+    let localAngle = baseAngle + Math.sin(i * wobbleFreq + wobblePhase) * wobbleAmp;
+    if (cx < MARGIN + EDGE_STEER_BUFFER) localAngle += EDGE_STEER_STRENGTH;
+    else if (cx > cols - MARGIN - EDGE_STEER_BUFFER) localAngle -= EDGE_STEER_STRENGTH;
+    if (cy < MARGIN + EDGE_STEER_BUFFER) localAngle += (localAngle >= 0 ? 1 : -1) * EDGE_STEER_STRENGTH;
+    const nx = cx + Math.sin(localAngle);
+    const ny = cy - Math.cos(localAngle);
+    if (nx < MARGIN || nx > cols - MARGIN || ny < MARGIN) { truncated = true; break; }
+    cx = nx; cy = ny;
+    pts.push({ x: Math.round(cx), y: Math.round(cy), ch: charForAngle(localAngle) });
+  }
+  return { pts, endX: cx, endY: cy, endAngle, truncated };
+}
+
+const TRUNK_BASE_WIDTH = 3; // trunk starts this wide and tapers by 1 at each stage/limb split
+
+// ── Grid ─────────────────────────────────────────────────────────────────
+const CHAR_ASPECT = 0.6;
+let COLS, ROWS, FONT_PX;
+
+function computeGrid() {
+  FONT_PX = Math.max(9, Math.min(20, Math.floor(window.innerWidth / 60)));
+  const charW = FONT_PX * CHAR_ASPECT;
+  COLS = Math.floor(window.innerWidth / charW);
+  ROWS = Math.floor(window.innerHeight / FONT_PX);
+  const el = document.getElementById('screen');
+  el.style.fontSize = FONT_PX + 'px';
+  el.style.lineHeight = '1.0';
+}
+
+// ── Tree generation (deterministic; full mature form built once) ────────
+let tree = null;
+
+// A handful of strands walk out from the branch tip and droop under
+// accumulating "gravity" rather than filling a round blob — foliage that
+// hangs and trails instead of puffing out as a circle.
+function makeLeafCluster(cx, cy, rng, threshold) {
+  const nStrands = 4 + Math.floor(rng() * 3);
+  const offsets = [];
+  for (let s = 0; s < nStrands; s++) {
+    const strandLen = 4 + Math.floor(rng() * 3);
+    let vx = (rng() - 0.5) * 1.6;
+    let vy = -(0.1 + rng() * 0.2); // starts heading up/out like a fresh shoot
+    let px = 0, py = 0;
+    for (let i = 0; i < strandLen; i++) {
+      px += vx; py += vy;
+      offsets.push({ dx: Math.round(px), dy: Math.round(py), ch: LEAF_CHARS[Math.floor(rng() * LEAF_CHARS.length)] });
+      const weight = (i + 1) / strandLen;
+      vy += 0.45 * weight; // gravity overtakes the initial lift, pulling the strand into a droop
+    }
+  }
+  return {
+    x: Math.round(cx), y: Math.round(cy), offsets, threshold,
+    color: LEAF_COLORS[Math.floor(rng() * LEAF_COLORS.length)],
+    trimmed: new Set(), // indices into offsets that have been pruned away individually
+  };
+}
+
+// Informal-upright bonsai structure: the trunk curves upward in stages, each
+// stage spawning a primary limb that sweeps out wide and mostly sideways
+// before curling gently upward, plus a shorter leader/apex on top — branches
+// at staggered heights, like a real tree, rather than all fanning from one
+// point. Every seed still randomizes the lean, limb count, angles and
+// lengths, but all trees share this same elegant, wide-spreading silhouette.
+function generateTree(seed, cols, rows) {
+  const rng = mulberry32(seed);
+  const baseX = Math.round(cols / 2);
+  const potW = Math.max(9, Math.round(cols * 0.14));
+  const soilY = rows - 4;
+  const TWIG_LIMIT = rows > 30 ? 9 : 7; // absolute depth cap where twigs stop and turn into leaves
+  const SEG_SPAN = 1 / (TWIG_LIMIT + 2);
+  const trunkLen = Math.max(5, Math.min(Math.round(rows * 0.2), Math.round(cols * 0.4)));
+
+  const segments = [];
+  const leaves = [];
+  let nextSegId = 0;
+  let nextLeafId = 0;
+
+  // Every branch/leaf gets an id and a parentId, so a later prune can find
+  // "everything downstream of this cut" by walking the parent chain.
+  function pushSegment(pts, depth, parentId, width) {
+    const baseThresh = depth * SEG_SPAN;
+    const threshold = Math.max(0, Math.min(0.97, baseThresh + (rng() - 0.5) * SEG_SPAN * 0.3));
+    const seg = { id: nextSegId++, parentId, pts, threshold, span: SEG_SPAN, width: width || 1 };
+    segments.push(seg);
+    return seg;
+  }
+
+  function pushLeaf(cx, cy, threshold, parentId) {
+    const leaf = makeLeafCluster(cx, cy, rng, threshold);
+    leaf.id = nextLeafId++;
+    leaf.parentId = parentId;
+    leaves.push(leaf);
+    return leaf;
+  }
+
+  // Twigs: fan out from a limb, gently curling back toward the limb's own
+  // heading, filling a leafy pad rather than shooting off independently.
+  function growTwig(x, y, angle, length, depth, parentId) {
+    const res = growCurve(rng, cols, rows, x, y, angle, angle * 0.5 + (rng() - 0.5) * 0.3, length);
+    if (res.pts.length === 0) {
+      pushLeaf(x, y, Math.min(0.99, depth * SEG_SPAN), parentId);
+      return;
+    }
+    const seg = pushSegment(res.pts, depth, parentId);
+    if (depth >= TWIG_LIMIT || res.truncated) {
+      pushLeaf(res.endX, res.endY, Math.min(0.99, seg.threshold + SEG_SPAN * 0.5 + rng() * 0.05), seg.id);
+      return;
+    }
+    const nTwigs = 1 + (rng() < 0.6 ? 1 : 0);
+    for (let i = 0; i < nTwigs; i++) {
+      const spread = (rng() - 0.5) * 1.0;
+      const childLength = length * (0.6 + rng() * 0.2);
+      if (childLength < 1.5) {
+        pushLeaf(res.endX, res.endY, Math.min(0.99, seg.threshold + SEG_SPAN * 0.6 + rng() * 0.05), seg.id);
+        continue;
+      }
+      growTwig(res.endX, res.endY, res.endAngle + spread, childLength, depth + 1, seg.id);
+    }
+  }
+
+  // A limb (primary scaffold or the apex leader): sweeps out and stays
+  // fairly diagonal (it doesn't curl back to near-vertical), with foliage
+  // sprouting at a couple of points along its length — not just the very
+  // tip — so leaves wrap around the branch instead of topping a bare stem.
+  function growLimb(x, y, startAngle, endAngle, length, depth, parentId, width) {
+    const res = growCurve(rng, cols, rows, x, y, startAngle, endAngle, length);
+    if (res.pts.length === 0) return null;
+    const seg = pushSegment(res.pts, depth, parentId, width);
+    if (res.truncated) {
+      pushLeaf(res.endX, res.endY, Math.min(0.99, seg.threshold + SEG_SPAN * 0.5), seg.id);
+      return seg;
+    }
+    const attachFracs = res.pts.length > 6 ? [0.55, 1.0] : [1.0];
+    attachFracs.forEach(frac => {
+      const idx = Math.min(res.pts.length - 1, Math.max(0, Math.round((res.pts.length - 1) * frac)));
+      const p = res.pts[idx];
+      const localAngle = startAngle + (endAngle - startAngle) * frac;
+      const nTwigs = 2 + Math.floor(rng() * 2);
+      for (let t = 0; t < nTwigs; t++) {
+        const spread = (rng() - 0.5) * 1.1;
+        const twigLen = length * (0.35 + rng() * 0.2);
+        growTwig(p.x, p.y, localAngle + spread, twigLen, depth + 1, seg.id);
+      }
+    });
+    return seg;
+  }
+
+  // Trunk grows in stages; each stage spawns a wide sideways limb at that
+  // height, so branches emerge at different points rather than all at once.
+  const nScaffold = 2 + (rng() < 0.35 ? 1 : 0);
+  const leanSign = rng() < 0.5 ? -1 : 1;
+  let cx = baseX, cy = soilY, cAngle = 0, depth = 0, parentId = -1;
+  let stageWidth = TRUNK_BASE_WIDTH;
+  for (let s = 0; s < nScaffold; s++) {
+    const stageLen = trunkLen * (0.3 + rng() * 0.12);
+    const targetLean = cAngle + leanSign * (0.12 + rng() * 0.16) * (s === 0 ? 1 : 0.6);
+    const stageRes = growCurve(rng, cols, rows, cx, cy, cAngle, targetLean, stageLen);
+    if (stageRes.pts.length === 0) break;
+    const stageSeg = pushSegment(stageRes.pts, depth++, parentId, stageWidth);
+    parentId = stageSeg.id;
+    cx = stageRes.endX; cy = stageRes.endY; cAngle = stageRes.endAngle;
+
+    const side = s % 2 === 0 ? -1 : 1;
+    const startA = cAngle + side * (0.9 + rng() * 0.35);
+    const endA = side * (0.6 + rng() * 0.35);
+    const limbLen = trunkLen * (0.55 + rng() * 0.25) * (1 - s * 0.1);
+    growLimb(cx, cy, startA, endA, limbLen, depth++, parentId, Math.max(1, stageWidth - 1));
+    stageWidth = Math.max(2, stageWidth - 1); // trunk tapers as it rises, but stays trunk-thick (>=2)
+  }
+
+  // Leader/apex continuing from the top of the trunk.
+  const leaderLen = trunkLen * (0.3 + rng() * 0.12);
+  growLimb(cx, cy, cAngle, cAngle * 0.6 + (rng() - 0.5) * 0.3, leaderLen, depth, parentId, Math.max(1, stageWidth - 1));
+
+  return {
+    segments, leaves, baseX, potW, soilY, nextSegId, nextLeafId,
+    removedSegIds: new Set(), removedLeafIds: new Set(), pruneEvents: [],
+  };
+}
+
+// ── Pruning ──────────────────────────────────────────────────────────────
+// Cutting a branch removes everything that grew from it; a new shoot then
+// buds at the cut and grows off in its own (freshly randomized) direction —
+// the digital equivalent of pruning encouraging back-budding on a real tree.
+const REGROWTH_SECONDS = 30 * 60; // a pruned shoot regrows over ~30 minutes
+
+function collectDescendants(t, segId) {
+  const segIds = new Set([segId]);
+  let changed = true;
+  while (changed) {
+    changed = false;
+    t.segments.forEach(s => {
+      if (!segIds.has(s.id) && segIds.has(s.parentId)) { segIds.add(s.id); changed = true; }
+    });
+  }
+  const leafIds = new Set();
+  t.leaves.forEach(l => { if (segIds.has(l.parentId)) leafIds.add(l.id); });
+  return { segIds, leafIds };
+}
+
+// A cut point's regrowth angle is derived from its salt so replaying the
+// same prune event (e.g. after a reload) always regrows identically.
+function regrowAngleFromSalt(salt) {
+  return (mulberry32(salt + 1)() - 0.5) * 2.8; // biased away from growing back down into the soil
+}
+
+// A small, self-contained shoot grown at a cut point — a scaled-down version
+// of a twig, appended directly into the (already-generated) tree.
+function growRegrowth(t, x, y, angle, prunedAtElapsed, salt, cols, rows) {
+  const rng = mulberry32(salt);
+  const REGROW_DEPTH = 4;
+  const SEG_SPAN = 1 / (REGROW_DEPTH + 1);
+  const baseLen = Math.max(3, Math.round(rows * 0.09));
+
+  function grow(gx, gy, gAngle, length, depth, parentId) {
+    const res = growCurve(rng, cols, rows, gx, gy, gAngle, gAngle * 0.5 + (rng() - 0.5) * 0.4, length);
+    const mkThresh = d => Math.max(0, Math.min(0.99, d * SEG_SPAN + (rng() - 0.5) * SEG_SPAN * 0.3));
+    if (res.pts.length === 0) {
+      const leaf = makeLeafCluster(gx, gy, rng, mkThresh(depth));
+      leaf.id = t.nextLeafId++; leaf.parentId = parentId; leaf.regrownAt = prunedAtElapsed;
+      t.leaves.push(leaf);
+      return;
+    }
+    const seg = { id: t.nextSegId++, parentId, pts: res.pts, threshold: mkThresh(depth), span: SEG_SPAN, regrownAt: prunedAtElapsed };
+    t.segments.push(seg);
+    if (depth >= REGROW_DEPTH || res.truncated) {
+      const leaf = makeLeafCluster(res.endX, res.endY, rng, Math.min(0.99, seg.threshold + SEG_SPAN * 0.5 + rng() * 0.05));
+      leaf.id = t.nextLeafId++; leaf.parentId = seg.id; leaf.regrownAt = prunedAtElapsed;
+      t.leaves.push(leaf);
+      return;
+    }
+    const n = 1 + (rng() < 0.5 ? 1 : 0);
+    for (let i = 0; i < n; i++) {
+      const spread = (rng() - 0.5) * 1.0;
+      const childLen = length * (0.6 + rng() * 0.2);
+      if (childLen < 1.3) {
+        const leaf = makeLeafCluster(res.endX, res.endY, rng, Math.min(0.99, seg.threshold + SEG_SPAN * 0.6 + rng() * 0.05));
+        leaf.id = t.nextLeafId++; leaf.parentId = seg.id; leaf.regrownAt = prunedAtElapsed;
+        t.leaves.push(leaf);
+        continue;
+      }
+      grow(res.endX, res.endY, res.endAngle + spread, childLen, depth + 1, seg.id);
+    }
+  }
+
+  grow(x, y, angle, baseLen, 0, -1);
+}
+
+// A regrown item's visibility is judged on its own clock (time since it was
+// pruned), not the tree's overall growth clock.
+function effectiveGrowth(item, globalG) {
+  if (item.regrownAt === undefined) return globalG;
+  const localT = Math.min(1, Math.max(0, (currentElapsedSeconds() - item.regrownAt) / REGROWTH_SECONDS));
+  return 1 - Math.pow(1 - localT, 3);
+}
+
+function applyCut(t, segId, cutIdx, cutX, cutY) {
+  const seg = t.segments.find(s => s.id === segId);
+  if (!seg) return;
+  seg.pts = seg.pts.slice(0, cutIdx);
+  const desc = collectDescendants(t, segId);
+  desc.segIds.delete(segId);
+  desc.segIds.forEach(id => t.removedSegIds.add(id));
+  desc.leafIds.forEach(id => t.removedLeafIds.add(id));
+  t.leaves.forEach(l => { if (l.parentId === segId) t.removedLeafIds.add(l.id); });
+}
+
+// Removes just the given cells of one leaf cluster — a light "pinch" that
+// still counts as a cut point, so a small nibble at the edge of a foliage
+// pad is prunable without taking the whole cluster.
+function applyLeafTrim(t, leafId, offsetIdxs) {
+  const leaf = t.leaves.find(l => l.id === leafId);
+  if (!leaf) return;
+  offsetIdxs.forEach(idx => leaf.trimmed.add(idx));
+  if (leaf.trimmed.size >= leaf.offsets.length) t.removedLeafIds.add(leafId);
+}
+
+// ── Prune persistence ───────────────────────────────────────────────────
+const PRUNE_KEY = 'bonsai_prunes_v1';
+const PRUNE_DIMS_KEY = 'bonsai_prune_dims_v1';
+
+function savePrunes() {
+  localStorage.setItem(PRUNE_KEY, JSON.stringify(tree.pruneEvents));
+  localStorage.setItem(PRUNE_DIMS_KEY, COLS + 'x' + ROWS);
+}
+
+// Prune events reference segment ids from a specific (cols, rows) layout, so
+// a resize (which regenerates the tree at a new size) starts the tree fresh
+// rather than trying to fuzzily reapply cuts to a different topology.
+function loadStoredPruneEvents() {
+  if (localStorage.getItem(PRUNE_DIMS_KEY) !== COLS + 'x' + ROWS) return [];
+  try {
+    return JSON.parse(localStorage.getItem(PRUNE_KEY) || '[]');
+  } catch {
+    return [];
+  }
+}
+
+// The tree is always "pristine generation + replay this exact event list" —
+// undo is just replaying with the last commit dropped, and a fresh load is
+// just replaying whatever was saved.
+function rebuildTree(events) {
+  tree = generateTree(SEED, COLS, ROWS);
+  events.forEach(ev => {
+    if (ev.type === 'branch') applyCut(tree, ev.segId, ev.cutIdx, ev.cutX, ev.cutY);
+    else applyLeafTrim(tree, ev.leafId, ev.trimmedIdxs || []);
+    growRegrowth(tree, ev.cutX, ev.cutY, regrowAngleFromSalt(ev.salt), ev.prunedAtElapsed, ev.salt, COLS, ROWS);
+  });
+  tree.pruneEvents = events;
+}
+
+// ── Rendering ────────────────────────────────────────────────────────────
+function drawPot(set, baseX, potW, soilY, trunkWidth) {
+  const half = Math.floor(potW / 2);
+  for (let dx = -half + 1; dx <= half - 1; dx++) {
+    set(soilY, baseX + dx, SOIL_CHARS[Math.abs(dx * 7 + 13) % SOIL_CHARS.length], L.SOIL);
+  }
+  set(soilY + 1, baseX - half, '.', L.POT);
+  set(soilY + 1, baseX + half, '.', L.POT);
+  for (let dx = -half + 1; dx <= half - 1; dx++) set(soilY + 1, baseX + dx, '-', L.POT);
+  set(soilY + 2, baseX - half, '|', L.POT);
+  set(soilY + 2, baseX + half, '|', L.POT);
+  set(soilY + 3, baseX - half, '\\', L.POT);
+  set(soilY + 3, baseX + half, '/', L.POT);
+  for (let dx = -half + 1; dx <= half - 1; dx++) set(soilY + 3, baseX + dx, '_', L.POT);
+
+  // Root flare where the trunk meets the soil, instead of it just
+  // plunging straight into the pot rim.
+  set(soilY, baseX - 2, '.', L.SOIL);
+  set(soilY, baseX - 1, '/', L.TRUNK);
+  set(soilY, baseX + trunkWidth, '\\', L.TRUNK);
+  set(soilY, baseX + trunkWidth + 1, '.', L.SOIL);
+}
+
+let tick = 0;
+
+function frame_() {
+  tick += 0.05;
+  const g = growthFraction();
+
+  const buf = Array.from({ length: ROWS }, () => new Array(COLS).fill(' '));
+  const layerBuf = Array.from({ length: ROWS }, () =>
+    Array.from({ length: COLS }, () => ({ layer: L.BG, color: null })));
+
+  function set(r, c, ch, layer, color = null) {
+    if (r < 0 || r >= ROWS || c < 0 || c >= COLS) return;
+    buf[r][c] = ch;
+    layerBuf[r][c] = { layer, color };
+  }
+
+  drawPot(set, tree.baseX, tree.potW, tree.soilY, TRUNK_BASE_WIDTH);
+  set(tree.soilY, tree.baseX, '.', L.SEED); // seed marker; trunk draws over it once it sprouts
+
+  tree.segments.forEach(seg => {
+    if (tree.removedSegIds.has(seg.id)) return;
+    const eg = effectiveGrowth(seg, g);
+    const frac = (eg - seg.threshold) / seg.span;
+    if (frac <= 0) return;
+    const n = Math.min(seg.pts.length, Math.ceil(Math.min(1, frac) * seg.pts.length));
+    const w = seg.width || 1;
+    for (let i = 0; i < n; i++) {
+      const p = seg.pts[i];
+      for (let dx = 0; dx < w; dx++) set(p.y, p.x + dx, p.ch, L.TRUNK);
+    }
+    if (frac < 1 && n > 0) {
+      const tip = seg.pts[n - 1];
+      set(tip.y, tip.x, '`', L.TIP);
+    }
+  });
+
+  tree.leaves.forEach(cluster => {
+    if (tree.removedLeafIds.has(cluster.id)) return;
+    const eg = effectiveGrowth(cluster, g);
+    if (eg < cluster.threshold) return;
+    cluster.offsets.forEach((o, idx) => {
+      if (cluster.trimmed.has(idx)) return;
+      const shimmer = Math.sin(tick * 0.4 + o.dx * 7 + o.dy * 13) > 0.985;
+      const isBlossom = eg > 0.9 && Math.sin(o.dx * 31 + o.dy * 17 + 5) > 0.93;
+      if (isBlossom) {
+        set(cluster.y + o.dy, cluster.x + o.dx, '*', L.BLOSSOM);
+      } else {
+        set(cluster.y + o.dy, cluster.x + o.dx, shimmer ? '+' : o.ch, L.LEAF, cluster.color);
+      }
+    });
+  });
+
+  const screen = document.getElementById('screen');
+  if (!COLOR) {
+    let out = '';
+    for (let r = 0; r < ROWS; r++) out += buf[r].join('') + '\n';
+    screen.textContent = out;
+  } else {
+    const frag = document.createDocumentFragment();
+    for (let r = 0; r < ROWS; r++) {
+      let runColor = null, runChars = '';
+      const flush = () => {
+        if (!runChars) return;
+        if (runColor) {
+          const sp = document.createElement('span');
+          sp.style.color = runColor;
+          sp.textContent = runChars;
+          frag.appendChild(sp);
+        } else {
+          frag.appendChild(document.createTextNode(runChars));
+        }
+        runChars = '';
+      };
+      for (let c = 0; c < COLS; c++) {
+        const { layer, color } = layerBuf[r][c];
+        const col = color || PALETTE[layer] || null;
+        if (col !== runColor) { flush(); runColor = col; }
+        runChars += buf[r][c];
+      }
+      runChars += '\n';
+      flush();
+    }
+    screen.innerHTML = '';
+    screen.appendChild(frag);
+  }
+
+  document.getElementById('status').textContent =
+    stageName(g) + ' · ' + formatElapsed(currentElapsedSeconds()) + ' open';
+
+  requestAnimationFrame(frame_);
+}
+
+// ── HUD toast ────────────────────────────────────────────────────────────
+const hudEl = document.getElementById('hud');
+let hudTimer = null;
+function showHud(text) {
+  hudEl.textContent = text;
+  hudEl.style.opacity = 1;
+  clearTimeout(hudTimer);
+  hudTimer = setTimeout(() => { hudEl.style.opacity = 0; }, 1300);
+}
+
+// ── Pruning: select and delete ────────────────────────────────────────────
+// Real text selection doesn't survive us redrawing the whole grid ~60x a
+// second, so a click-drag box over the character grid stands in for
+// "highlight" — Delete/Backspace then cuts whatever it covers.
+const screenEl = document.getElementById('screen');
+const selectionEl = document.getElementById('selection');
+let selecting = false;
+let selStart = null;
+let selBox = null;
+let redoStack = []; // groups of prune events removed by undo, most-recent last
+
+function pixelToGrid(clientX, clientY) {
+  const rect = screenEl.getBoundingClientRect();
+  const charW = FONT_PX * CHAR_ASPECT;
+  return {
+    col: Math.floor((clientX - rect.left) / charW),
+    row: Math.floor((clientY - rect.top) / FONT_PX),
+  };
+}
+
+function updateSelectionOverlay() {
+  if (!selBox) { selectionEl.style.display = 'none'; return; }
+  const charW = FONT_PX * CHAR_ASPECT;
+  selectionEl.style.display = 'block';
+  selectionEl.style.left = (selBox.c0 * charW) + 'px';
+  selectionEl.style.top = (selBox.r0 * FONT_PX) + 'px';
+  selectionEl.style.width = ((selBox.c1 - selBox.c0 + 1) * charW) + 'px';
+  selectionEl.style.height = ((selBox.r1 - selBox.r0 + 1) * FONT_PX) + 'px';
+}
+
+screenEl.addEventListener('mousedown', e => {
+  selecting = true;
+  selStart = pixelToGrid(e.clientX, e.clientY);
+  selBox = { c0: selStart.col, r0: selStart.row, c1: selStart.col, r1: selStart.row };
+  updateSelectionOverlay();
+  e.preventDefault();
+});
+window.addEventListener('mousemove', e => {
+  if (!selecting) return;
+  const cur = pixelToGrid(e.clientX, e.clientY);
+  selBox = {
+    c0: Math.min(selStart.col, cur.col), c1: Math.max(selStart.col, cur.col),
+    r0: Math.min(selStart.row, cur.row), r1: Math.max(selStart.row, cur.row),
+  };
+  updateSelectionOverlay();
+});
+window.addEventListener('mouseup', () => {
+  if (!selecting) return;
+  selecting = false;
+  if (selBox.c0 === selBox.c1 && selBox.r0 === selBox.r1) { selBox = null; updateSelectionOverlay(); }
+});
+
+function inBox(box, x, y) {
+  return x >= box.c0 && x <= box.c1 && y >= box.r0 && y <= box.r1;
+}
+
+function nextCommitId() {
+  return tree.pruneEvents.reduce((m, e) => Math.max(m, e.commitId), 0) + 1;
+}
+
+function commitPrune() {
+  const box = selBox;
+  selBox = null;
+  updateSelectionOverlay();
+  const g = growthFraction();
+  const nowElapsed = currentElapsedSeconds();
+  const commitId = nextCommitId();
+
+  // Phase 1: find what the box hits, without mutating the tree yet (cutting
+  // one branch can remove others as descendants, so we don't want to act on
+  // a snapshot that's gone stale mid-scan).
+  const segHits = [];
+  tree.segments.forEach(seg => {
+    if (tree.removedSegIds.has(seg.id)) return;
+    const eg = effectiveGrowth(seg, g);
+    const visibleFrac = Math.max(0, Math.min(1, (eg - seg.threshold) / seg.span));
+    const visibleCount = Math.ceil(visibleFrac * seg.pts.length);
+    for (let i = 0; i < visibleCount; i++) {
+      const p = seg.pts[i];
+      if (inBox(box, p.x, p.y)) { segHits.push({ segId: seg.id, cutIdx: i, cutX: p.x, cutY: p.y }); break; }
+    }
+  });
+  // Leaves are hit-tested cell by cell (not just the cluster's center), and
+  // only the cells actually inside the box are trimmed — so nibbling a
+  // little outer foliage takes just that bit, not the whole cluster.
+  const leafHits = [];
+  tree.leaves.forEach(leaf => {
+    if (tree.removedLeafIds.has(leaf.id)) return;
+    const eg = effectiveGrowth(leaf, g);
+    if (eg < leaf.threshold) return;
+    const hitIdxs = [];
+    leaf.offsets.forEach((o, idx) => {
+      if (leaf.trimmed.has(idx)) return;
+      if (inBox(box, leaf.x + o.dx, leaf.y + o.dy)) hitIdxs.push(idx);
+    });
+    if (hitIdxs.length > 0) leafHits.push({ leafId: leaf.id, cutX: leaf.x, cutY: leaf.y, hitIdxs });
+  });
+
+  // Phase 2: apply the cuts (ancestors are hit before their descendants,
+  // since segments are generated parent-first, so a later hit already
+  // covered by an earlier cut is simply skipped).
+  let cutCount = 0;
+  segHits.forEach(hit => {
+    if (tree.removedSegIds.has(hit.segId)) return;
+    applyCut(tree, hit.segId, hit.cutIdx, hit.cutX, hit.cutY);
+    const salt = SEED + hit.segId * 7919 + Math.round(hit.cutX * 131 + hit.cutY * 17) + tree.pruneEvents.length;
+    growRegrowth(tree, hit.cutX, hit.cutY, regrowAngleFromSalt(salt), nowElapsed, salt, COLS, ROWS);
+    tree.pruneEvents.push({ type: 'branch', segId: hit.segId, cutIdx: hit.cutIdx, cutX: hit.cutX, cutY: hit.cutY, prunedAtElapsed: nowElapsed, salt, commitId });
+    cutCount++;
+  });
+  leafHits.forEach(hit => {
+    if (tree.removedLeafIds.has(hit.leafId)) return;
+    applyLeafTrim(tree, hit.leafId, hit.hitIdxs);
+    const salt = SEED + hit.leafId * 6151 + Math.round(hit.cutX * 131 + hit.cutY * 17) + tree.pruneEvents.length;
+    growRegrowth(tree, hit.cutX, hit.cutY, regrowAngleFromSalt(salt), nowElapsed, salt, COLS, ROWS);
+    tree.pruneEvents.push({ type: 'leaf', leafId: hit.leafId, trimmedIdxs: hit.hitIdxs, cutX: hit.cutX, cutY: hit.cutY, prunedAtElapsed: nowElapsed, salt, commitId });
+    cutCount++;
+  });
+
+  if (cutCount > 0) { redoStack = []; showHud('PRUNED'); savePrunes(); }
+  else showHud('NOTHING TO PRUNE');
+}
+
+function undoLastPrune() {
+  if (tree.pruneEvents.length === 0) { showHud('NOTHING TO UNDO'); return; }
+  const lastCommitId = tree.pruneEvents[tree.pruneEvents.length - 1].commitId;
+  const undone = tree.pruneEvents.filter(e => e.commitId === lastCommitId);
+  const remaining = tree.pruneEvents.filter(e => e.commitId !== lastCommitId);
+  redoStack.push(undone);
+  rebuildTree(remaining);
+  savePrunes();
+  showHud('UNDO');
+}
+
+function redoLastPrune() {
+  if (redoStack.length === 0) { showHud('NOTHING TO REDO'); return; }
+  const redone = redoStack.pop();
+  rebuildTree([...tree.pruneEvents, ...redone]);
+  savePrunes();
+  showHud('REDO');
+}
+
+// ── Key controls ─────────────────────────────────────────────────────────
+document.addEventListener('keydown', e => {
+  switch (e.key) {
+    case 'c': case 'C':
+      COLOR = !COLOR;
+      showHud('COLOR: ' + (COLOR ? 'ON' : 'OFF'));
+      break;
+    case 'Delete': case 'Backspace':
+      if (selBox) { commitPrune(); e.preventDefault(); }
+      break;
+    case 'Escape':
+      if (selBox) { selBox = null; updateSelectionOverlay(); }
+      break;
+    case 'z': case 'Z':
+      // Cmd/Ctrl+Z undoes, Cmd/Ctrl+Shift+Z redoes (the standard pairing —
+      // Cmd+R is reserved by the browser for reloading the page, and plain
+      // 'r' already means "full reset" here, so it can't double as redo).
+      if (e.shiftKey && (e.metaKey || e.ctrlKey)) redoLastPrune();
+      else undoLastPrune();
+      e.preventDefault();
+      break;
+    case 'r': case 'R':
+      window.removeEventListener('beforeunload', saveElapsed);
+      localStorage.removeItem(SEED_KEY);
+      localStorage.removeItem(TIME_KEY);
+      localStorage.removeItem(PRUNE_KEY);
+      localStorage.removeItem(PRUNE_DIMS_KEY);
+      location.reload();
+      break;
+  }
+});
+
+// ── Init ─────────────────────────────────────────────────────────────────
+function init() {
+  computeGrid();
+  rebuildTree(loadStoredPruneEvents());
+  frame_();
+}
+
+window.addEventListener('resize', () => {
+  computeGrid();
+  rebuildTree(loadStoredPruneEvents());
+  selBox = null;
+  updateSelectionOverlay();
+});
+window.addEventListener('beforeunload', saveElapsed);
+document.addEventListener('visibilitychange', () => { if (document.hidden) saveElapsed(); });
+setInterval(saveElapsed, 5000);
+
+init();
+</script>
+</body>
+</html>

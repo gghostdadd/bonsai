@@ -204,6 +204,26 @@ function computeGrid() {
   el.style.lineHeight = '1.0';
 }
 
+// The tree's structure (trunk length, branch counts, angles — everything
+// generateTree computes from cols/rows) is generated once from these
+// reference dimensions and never again, so it stays the same shape for the
+// life of the seed. Only its on-screen position adapts to the live window
+// size (see translateTree) — a resize repositions the tree, it doesn't
+// regrow a different one.
+const REFDIMS_KEY = 'bonsai_refdims_v1';
+let REF_COLS, REF_ROWS;
+
+function loadOrCreateRefDims() {
+  const stored = localStorage.getItem(REFDIMS_KEY);
+  if (stored) {
+    const [c, r] = stored.split('x').map(Number);
+    if (c > 0 && r > 0) return { cols: c, rows: r };
+  }
+  const dims = { cols: COLS, rows: ROWS };
+  localStorage.setItem(REFDIMS_KEY, dims.cols + 'x' + dims.rows);
+  return dims;
+}
+
 // ── Tree generation (deterministic; full mature form built once) ────────
 let tree = null;
 
@@ -454,18 +474,12 @@ function applyLeafTrim(t, leafId, offsetIdxs) {
 
 // ── Prune persistence ───────────────────────────────────────────────────
 const PRUNE_KEY = 'bonsai_prunes_v1';
-const PRUNE_DIMS_KEY = 'bonsai_prune_dims_v1';
 
 function savePrunes() {
   localStorage.setItem(PRUNE_KEY, JSON.stringify(tree.pruneEvents));
-  localStorage.setItem(PRUNE_DIMS_KEY, COLS + 'x' + ROWS);
 }
 
-// Prune events reference segment ids from a specific (cols, rows) layout, so
-// a resize (which regenerates the tree at a new size) starts the tree fresh
-// rather than trying to fuzzily reapply cuts to a different topology.
 function loadStoredPruneEvents() {
-  if (localStorage.getItem(PRUNE_DIMS_KEY) !== COLS + 'x' + ROWS) return [];
   try {
     return JSON.parse(localStorage.getItem(PRUNE_KEY) || '[]');
   } catch {
@@ -473,17 +487,41 @@ function loadStoredPruneEvents() {
   }
 }
 
-// The tree is always "pristine generation + replay this exact event list" —
-// undo is just replaying with the last commit dropped, and a fresh load is
-// just replaying whatever was saved.
+// Shifts every already-generated point by (dx, dy) — repositions the tree
+// to wherever the pot currently belongs without touching its shape at all.
+function translateTree(t, dx, dy) {
+  if (dx === 0 && dy === 0) return;
+  t.segments.forEach(seg => seg.pts.forEach(p => { p.x += dx; p.y += dy; }));
+  t.leaves.forEach(leaf => { leaf.x += dx; leaf.y += dy; });
+  t.baseX += dx;
+  t.soilY += dy;
+}
+
+// The tree is always "pristine generation (from the fixed reference
+// dimensions) + replay this exact event list" — undo is just replaying with
+// the last commit dropped, and a fresh load is just replaying whatever was
+// saved. Regrowth origins are derived fresh from the (already-cut) branch or
+// leaf rather than from a stored coordinate, so replaying stays correct no
+// matter what size the tree is being displayed at right now. The very last
+// step repositions the finished tree to the current window's pot anchor.
 function rebuildTree(events) {
-  tree = generateTree(SEED, COLS, ROWS);
+  tree = generateTree(SEED, REF_COLS, REF_ROWS);
   events.forEach(ev => {
-    if (ev.type === 'branch') applyCut(tree, ev.segId, ev.cutIdx, ev.cutX, ev.cutY);
-    else applyLeafTrim(tree, ev.leafId, ev.trimmedIdxs || []);
-    growRegrowth(tree, ev.cutX, ev.cutY, regrowAngleFromSalt(ev.salt), ev.prunedAtElapsed, ev.salt, COLS, ROWS);
+    let origin = { x: tree.baseX, y: tree.soilY };
+    if (ev.type === 'branch') {
+      applyCut(tree, ev.segId, ev.cutIdx, ev.cutX, ev.cutY);
+      const seg = tree.segments.find(s => s.id === ev.segId);
+      if (seg && seg.pts.length) origin = seg.pts[seg.pts.length - 1];
+    } else {
+      applyLeafTrim(tree, ev.leafId, ev.trimmedIdxs || []);
+      const leaf = tree.leaves.find(l => l.id === ev.leafId);
+      if (leaf) origin = { x: leaf.x, y: leaf.y };
+    }
+    growRegrowth(tree, origin.x, origin.y, regrowAngleFromSalt(ev.salt), ev.prunedAtElapsed, ev.salt, REF_COLS, REF_ROWS);
   });
   tree.pruneEvents = events;
+  tree.potW = Math.max(9, Math.round(COLS * 0.14));
+  translateTree(tree, Math.round(COLS / 2) - tree.baseX, (ROWS - 4) - tree.soilY);
 }
 
 // ── Rendering ────────────────────────────────────────────────────────────
@@ -779,7 +817,7 @@ document.addEventListener('keydown', e => {
       localStorage.removeItem(SEED_KEY);
       localStorage.removeItem(TIME_KEY);
       localStorage.removeItem(PRUNE_KEY);
-      localStorage.removeItem(PRUNE_DIMS_KEY);
+      localStorage.removeItem(REFDIMS_KEY);
       location.reload();
       break;
   }
@@ -788,13 +826,20 @@ document.addEventListener('keydown', e => {
 // ── Init ─────────────────────────────────────────────────────────────────
 function init() {
   computeGrid();
+  const ref = loadOrCreateRefDims();
+  REF_COLS = ref.cols; REF_ROWS = ref.rows;
   rebuildTree(loadStoredPruneEvents());
   frame_();
 }
 
+// A resize only ever repositions the already-generated tree to the new
+// window's pot anchor — it never regenerates, so the tree's actual shape
+// (and any pruning) survives however you resize the browser.
 window.addEventListener('resize', () => {
+  const anchorX = tree.baseX, anchorY = tree.soilY;
   computeGrid();
-  rebuildTree(loadStoredPruneEvents());
+  translateTree(tree, Math.round(COLS / 2) - anchorX, (ROWS - 4) - anchorY);
+  tree.potW = Math.max(9, Math.round(COLS * 0.14));
   selBox = null;
   updateSelectionOverlay();
 });
